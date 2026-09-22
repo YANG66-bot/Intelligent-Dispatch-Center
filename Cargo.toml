@@ -1,0 +1,55 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+authors = ["Robot Scheduling System"]
+description = "高性能机器人调度系统 (Robot Scheduling System) 核心骨架"
+# 存在多个 bin（app=GUI、headless=无头演示）时，指定 `cargo run` 默认运行 GUI。
+default-run = "app"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 高性能通道 / 并发容器 / 轻量锁
+flume = "0.11"
+crossbeam-channel = "0.5"
+dashmap = "6"
+parking_lot = "0.12"
+
+# 序列化 / 反序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+
+# 内存与数据结构
+smallvec = { version = "1", features = ["serde", "union"] }
+bytes = "1"
+
+# 协议编解码框架
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+byteorder = "1"
+
+# 追踪与日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 高性能随机数（模拟机器人上报）
+rand = "0.9"
+
+# GUI 框架：Slint（声明式 UI + 命令式 Rust 桥接）
+slint = "1"
+
+[build-dependencies]
+# 在构建时编译 .slint 界面定义
+slint-build = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

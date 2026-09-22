@@ -1,0 +1,489 @@
+// AGV/AMR 智能调度中心 —— Slint 界面定义
+//
+// 布局：顶部指标卡片条 + 仿真控制条；中部为「实时路网地图 + 右侧机器人/任务列表」；
+// 底部为吞吐折线图（心跳速率·分配速率·累计完成率）。
+// 所有含数字的展示文本均在 Rust 侧预格式化为字符串，Slint 端不做数值转字符串，规避语法差异。
+// 连线/轨迹/折线图用 Path + SVG commands 字符串渲染（Rust 侧生成 "M x y L x y ..."）。
+
+import { Button, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
+
+// ---------------- 数据模型（由 Rust 填充） ----------------
+
+// 地图逻辑画布尺寸（像素）。Rust 侧的世界坐标→像素变换必须与此保持一致。
+export global Canvas {
+    out property <length> w: 760px;
+    out property <length> h: 470px;
+}
+
+export struct RobotInfo {
+    id: int,
+    sx: length,        // 本体中心 x（= gx, gy - lift）
+    sy: length,        // 本体中心 y
+    gx: length,        // 地面投影 x
+    gy: length,        // 地面投影 y
+    lift: length,      // 悬浮高度（编码电量）
+    status: int,       // 0空闲 1忙碌 2充电 3故障 4离线
+    battery: int,      // 0..100
+    deadlocked: bool,
+    crowded: bool,
+    selected: bool,
+    carrying: bool,    // 是否载货（取货送达途中）
+    tag: string,       // "#12"
+    row: string,       // 列表整行文本
+}
+
+export struct NodeInfo {
+    sx: length,
+    sy: length,
+}
+
+// 目的地标记：地面坐标 + 是否为选中机器人（选中显示旗帜）。
+export struct DestInfo {
+    sx: length,
+    sy: length,
+    sel: bool,
+}
+
+export struct MarkerInfo {
+    sx: length,
+    sy: length,
+    kind: int,         // 0拥挤 1目标争用
+    label: string,
+}
+
+export struct TaskInfo {
+    row: string,
+    status: int,       // 0待处理 1已分配 2执行中 3已完成 4失败
+}
+
+// ---------------- 复用小组件 ----------------
+
+component MetricBox inherits Rectangle {
+    in property <string> value;
+    in property <string> label;
+    in property <color> accent: white;
+    width: 92px;
+    height: 46px;
+    border-radius: 6px;
+    background: #222226;
+    VerticalLayout {
+        alignment: center;
+        Text { text: value; color: accent; horizontal-alignment: center; font-size: 17px; font-weight: 700; }
+        Text { text: label; color: #9a9aa0; horizontal-alignment: center; font-size: 11px; }
+    }
+}
+
+component ChartBox inherits Rectangle {
+    in property <string> title;
+    in property <string> path;
+    in property <color> accent: #96969f;
+    in property <string> latest;
+    in property <string> unit;
+    width: 360px;
+    border-radius: 6px;
+    background: #1c1c1f;
+    border-width: 1px;
+    border-color: #2f2f33;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        HorizontalLayout {
+            Text { text: title; color: #c8c8ce; font-size: 12px; font-weight: 600; }
+            Rectangle {}
+            Text { text: latest; color: root.accent; font-size: 12px; }
+            Text { text: unit; color: #7a7a80; font-size: 10px; }
+        }
+        // 固定像素绘图区：Rust 侧按 344x112 预先生成 SVG 路径坐标
+        Rectangle {
+            width: 344px;
+            height: 112px;
+            clip: true;
+            Path {
+                x: 0px; y: 0px;
+                width: 344px; height: 112px;
+                stroke-width: 1.5px;
+                stroke: root.accent;
+                fill: Colors.transparent;
+                commands: root.path;
+            }
+        }
+    }
+}
+
+// ---------------- 主窗口 ----------------
+
+export component MainWindow inherits Window {
+    title: "AGV/AMR Scheduler";
+    background: #1e1e22;
+    preferred-width: 1200px;
+    preferred-height: 860px;
+    min-width: 980px;
+    min-height: 680px;
+
+    // ---- 只读数据 ----
+    in property <[RobotInfo]> robots;
+    in property <[NodeInfo]> nodes;
+    in property <[NodeInfo]> chargers;
+    in property <[TaskInfo]> tasks;
+    in property <[MarkerInfo]> markers;
+    in property <string> edges-path;
+    in property <string> trail-path;
+    // 选中机器人的前方计划路线（地面坐标 SVG 折线，由 Rust 生成）
+    in property <string> route-path;
+    // 各机器人目的地标记（选中者附旗帜）
+    in property <[DestInfo]> dests;
+    // 等距地板：棋盘浅/深两块闭合菱形集合 + 网格描边（Rust 生成 SVG）
+    in property <string> floor-light;
+    in property <string> floor-dark;
+    in property <string> floor-grid;
+
+    // 指标条文本
+    in property <string> m-online: "0";
+    in property <string> m-idle: "0";
+    in property <string> m-busy: "0";
+    in property <string> m-pending: "0";
+    in property <string> m-running: "0";
+    in property <string> m-done: "0";
+    in property <string> m-hb: "0";
+    in property <string> m-conn: "0";
+    in property <string> conflict-line;
+
+    // 折线图
+    in property <string> hb-path;
+    in property <string> asg-path;
+    in property <string> rate-path;
+    in property <string> hb-latest: "-";
+    in property <string> asg-latest: "-";
+    in property <string> rate-latest: "-";
+
+    // 选中机器人详情
+    in property <bool> sel-visible: false;
+    in property <string> sel-title;
+    in property <string> sel-status;
+    in property <string> sel-battery;
+    in property <string> sel-node;
+    in property <string> sel-target;
+    in property <string> sel-trail;
+    in property <string> sel-task;
+
+    // 列表标题
+    in property <string> robots-title: "机器人";
+    in property <string> tasks-title: "任务看板";
+    in property <string> map-hint: "";
+
+    // ---- 双向 UI 状态 ----
+    in-out property <int> fleet-size: 8;
+    in-out property <bool> show-charts: true;
+    in-out property <bool> show-conflict: true;
+    in-out property <bool> auto-tasks: false;
+    in-out property <bool> view-iso: true;   // true=等距 2.5D，false=顶视 2D
+
+    // ---- 回调 ----
+    callback connect-fleet(int);
+    callback disconnect-fleet();
+    callback submit-one();
+    callback select-robot(int);
+    callback clear-selection();
+
+    // ---- 颜色映射 ----
+    pure function statusColor(s: int) -> color {
+        if (s == 1) { return #5aa0ff; }
+        if (s == 2) { return #fac850; }
+        if (s == 3) { return #f05a5a; }
+        if (s == 4) { return #6e6e6e; }
+        return #50c878;
+    }
+    pure function taskColor(s: int) -> color {
+        if (s == 1) { return #5aa0ff; }
+        if (s == 2) { return #fab446; }
+        if (s == 3) { return #78c878; }
+        if (s == 4) { return #f05a5a; }
+        return #c878f0;
+    }
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // ===== 顶部：标题 + 指标 =====
+        HorizontalLayout {
+            Text { text: "AGV/AMR 智能调度中心"; color: white; font-size: 18px; font-weight: 700; vertical-alignment: center; }
+            Rectangle {}
+            MetricBox { value: m-online; label: "在线"; accent: #50aaff; }
+            MetricBox { value: m-idle; label: "空闲"; accent: #50c878; }
+            MetricBox { value: m-busy; label: "忙碌"; accent: #fab446; }
+            MetricBox { value: m-pending; label: "待处理"; accent: #c878f0; }
+            MetricBox { value: m-running; label: "执行中"; accent: #ff965a; }
+            MetricBox { value: m-done; label: "已完成"; accent: #78c878; }
+            MetricBox { value: m-hb; label: "心跳"; accent: #a0a0a0; }
+            MetricBox { value: m-conn; label: "连接"; accent: #c0c0c0; }
+        }
+
+        // ===== 控制条 =====
+        HorizontalLayout {
+            spacing: 10px;
+            Text { text: "机器人数"; color: #c8c8ce; vertical-alignment: center; }
+            SpinBox { value <=> fleet-size; }
+            Button {
+                text: "▶ 接入 / 重启集群";
+                clicked => { connect-fleet(fleet-size); }
+            }
+            Button { text: "✖ 断开全部"; clicked => { disconnect-fleet(); } }
+            CheckBox {
+                text: "⚡ 自动生成任务";
+                checked <=> auto-tasks;
+            }
+            Button { text: "＋ 单发任务"; clicked => { submit-one(); } }
+            Rectangle {}
+            CheckBox { text: "◇ 等距视图"; checked <=> view-iso; }
+            CheckBox { text: "📈 吞吐曲线"; checked <=> show-charts; }
+            CheckBox { text: "⚠ 冲突/死锁"; checked <=> show-conflict; }
+        }
+
+        // 冲突态势条
+        if show-conflict && markers.length > 0 : HorizontalLayout {
+            Text { text: conflict-line; color: #ff6e6e; font-weight: 600; }
+        }
+
+        // ===== 中部：地图 + 右侧列表 =====
+        HorizontalLayout {
+            spacing: 10px;
+
+            // 地图
+            Rectangle {
+                width: Canvas.w;
+                height: Canvas.h;
+                border-radius: 4px;
+                background: #161616;
+                clip: true;
+
+                // 等距地板：深色块 + 浅色块（棋盘）+ 网格描边（均由 Rust 生成闭合菱形集合）
+                Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke: Colors.transparent;
+                    fill: #1d1d22;
+                    commands: floor-dark;
+                }
+                Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke: Colors.transparent;
+                    fill: #26262d;
+                    commands: floor-light;
+                }
+                Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke-width: 1px;
+                    stroke: #34343c;
+                    fill: Colors.transparent;
+                    commands: floor-grid;
+                }
+
+                // 边（贴地单一 SVG 路径）
+                Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke-width: 1.4px;
+                    stroke: #41608a;
+                    fill: Colors.transparent;
+                    commands: edges-path;
+                }
+
+                // 节点（地面小圆点）
+                for n in nodes: Rectangle {
+                    x: n.sx - 1.5px; y: n.sy - 1.5px;
+                    width: 3px; height: 3px;
+                    border-radius: 1.5px;
+                    background: #6b7684;
+                }
+
+                // 充电桩：地面基座 + 黄色支柱 + 顶部 ⚡（固定悬浮高度营造 3D）
+                for c in chargers: Rectangle {
+                    x: c.sx; y: c.sy; width: 0px; height: 0px;
+                    // 地面阴影
+                    Rectangle {
+                        x: -9px; y: -4px; width: 18px; height: 8px; border-radius: 4px;
+                        background: #00000066;
+                    }
+                    // 支柱
+                    Rectangle {
+                        x: -1.5px; y: -30px; width: 3px; height: 30px;
+                        background: #8a6f22;
+                    }
+                    // 顶部标记框
+                    Rectangle {
+                        x: -8px; y: -38px; width: 16px; height: 16px;
+                        border-radius: 3px; border-width: 1.5px; border-color: #fac850;
+                        background: #2a2410;
+                        Text { text: "⚡"; color: #fac850; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                // 冲突标记（定位到地面；Rust 在关闭叠加时下发空列表）
+                for m in markers: Rectangle {
+                    x: m.sx - 13px; y: m.sy - 8px;
+                    width: 26px; height: 16px;
+                    border-radius: 13px;
+                    border-width: 2px;
+                    border-color: m.kind == 0 ? #faaa3c : #c878f0;
+                    background: Colors.transparent;
+                    Text { text: m.label; color: m.kind == 0 ? #faaa3c : #c878f0; font-size: 10px; horizontal-alignment: center; y: 1px; }
+                }
+
+                // 选中机器人轨迹（贴地）
+                if sel-visible: Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke-width: 2px;
+                    stroke: #3cdcdc;
+                    fill: Colors.transparent;
+                    commands: trail-path;
+                }
+
+                // 选中机器人的前方计划路线（贴地高亮折线）
+                Path {
+                    x: 0px; y: 0px;
+                    width: parent.width; height: parent.height;
+                    stroke-width: 2.2px;
+                    stroke: #ff6ec7;
+                    fill: Colors.transparent;
+                    commands: route-path;
+                }
+
+                // 各机器人目的地标记：小圆环；选中者额外显示旗帜
+                for d in dests: Rectangle {
+                    x: d.sx; y: d.sy; width: 0px; height: 0px;
+                    Rectangle {
+                        x: -4px; y: -4px; width: 8px; height: 8px;
+                        border-radius: 4px;
+                        border-width: 1.5px;
+                        border-color: d.sel ? #ffcf5a : #ff965a;
+                        background: Colors.transparent;
+                    }
+                    if d.sel: Text {
+                        text: "⚑"; color: #ffcf5a; font-size: 14px;
+                        x: -7px; y: -21px;
+                    }
+                }
+
+                // 机器人：地面阴影 + 支柱 + 抬升本体（外层为地面锚点，子元素按偏移叠放）
+                for r in robots: Rectangle {
+                    x: r.gx; y: r.gy; width: 0px; height: 0px;
+                    // 地面阴影
+                    Rectangle {
+                        x: -9px; y: -4px; width: 18px; height: 8px; border-radius: 4px;
+                        background: #00000066;
+                    }
+                    // 支柱（连接地面与本体，颜色随状态、半透明）
+                    Rectangle {
+                        x: -1px; y: -r.lift; width: 2px; height: r.lift;
+                        background: statusColor(r.status);
+                        opacity: 0.5;
+                    }
+                    // 本体
+                    Rectangle {
+                        x: -8px; y: -r.lift - 8px; width: 16px; height: 16px;
+                        border-radius: 8px;
+                        background: statusColor(r.status);
+                        border-width: r.selected ? 2px : 0px;
+                        border-color: white;
+
+                        Text { text: r.tag; color: white; font-size: 10px; x: -10px; y: -15px; }
+                        // 载货：本体顶部叠一个小货箱（棕色 + 描边）
+                        if r.carrying: Rectangle {
+                            x: -5px; y: -13px; width: 10px; height: 8px;
+                            border-radius: 1px;
+                            border-width: 1px; border-color: #6b4a1f;
+                            background: #b5842f;
+                        }
+                        // 电量条
+                        Rectangle { x: -3px; y: 18px; width: 22px; height: 3px; background: #2d2d2d;
+                            Rectangle { width: 22px * (r.battery / 100); height: 3px; background: r.battery < 20 ? #f05a5a : #78d28c; }
+                        }
+                        // 死锁脉冲环
+                        if r.deadlocked: Rectangle {
+                            x: -5px; y: -5px; width: 26px; height: 26px; border-radius: 13px;
+                            border-width: 2px; border-color: #ff3c3c; background: Colors.transparent;
+                        }
+                        // 点击拾取
+                        TouchArea {
+                            width: 20px; height: 20px; x: -2px; y: -2px;
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { select-robot(r.id); }
+                        }
+                    }
+                }
+
+                // 左上角提示
+                Text { text: map-hint; color: #a0a0a6; font-size: 12px; x: 10px; y: 8px; }
+
+                // 详情浮层（右上角）
+                if sel-visible: Rectangle {
+                    x: parent.width - 262px; y: 8px;
+                    width: 254px; height: 232px;
+                    border-radius: 8px;
+                    background: #232327;
+                    border-width: 1px;
+                    border-color: #3a3a3e;
+
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            Text { text: sel-title; color: white; font-weight: 700; font-size: 14px; }
+                            Rectangle {}
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                TouchArea { width: 22px; height: 22px; clicked => { clear-selection(); } }
+                                Text { text: "✕"; color: #b0b0b6; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #3a3a3e; }
+                        Text { text: sel-status; color: #d0d0d6; font-size: 12px; }
+                        Text { text: sel-battery; color: #d0d0d6; font-size: 12px; }
+                        Text { text: sel-node; color: #d0d0d6; font-size: 12px; }
+                        Text { text: sel-target; color: #d0d0d6; font-size: 12px; }
+                        Text { text: sel-trail; color: #8fd0d0; font-size: 12px; }
+                        Rectangle { height: 1px; background: #3a3a3e; }
+                        Text { text: sel-task; color: #d0d0d6; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
+            }
+
+            // 右侧列表
+            Rectangle {
+                width: 340px;
+                VerticalLayout {
+                    spacing: 6px;
+                    Text { text: robots-title; color: white; font-weight: 700; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            for r in robots: Text { text: r.row; color: statusColor(r.status); font-size: 12px; }
+                        }
+                    }
+                    Text { text: tasks-title; color: white; font-weight: 700; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            for t in tasks: Text { text: t.row; color: taskColor(t.status); font-size: 12px; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 底部：吞吐折线图 =====
+        if show-charts: Rectangle {
+            height: 156px;
+            HorizontalLayout {
+                spacing: 10px;
+                ChartBox { title: "心跳速率"; path: hb-path; accent: #96969f; latest: hb-latest; unit: "次/秒"; }
+                ChartBox { title: "分配速率"; path: asg-path; accent: #5aa0ff; latest: asg-latest; unit: "次/秒"; }
+                ChartBox { title: "累计完成率"; path: rate-path; accent: #78c878; latest: rate-latest; unit: "%"; }
+            }
+        }
+    }
+}
